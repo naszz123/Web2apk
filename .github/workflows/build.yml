@@ -1,0 +1,168 @@
+name: Build APK
+
+on:
+  repository_dispatch:
+    types: [build-request]
+  workflow_dispatch:
+    inputs:
+      downloadUrl:
+        description: 'URL download ZIP project'
+        required: true
+      projectType:
+        description: 'Project type (flutter/android)'
+        required: true
+        default: 'flutter'
+      buildType:
+        description: 'Build type (release/debug)'
+        required: true
+        default: 'release'
+      callbackUrl:
+        description: 'Callback URL VPS'
+        required: true
+      requestId:
+        description: 'Request ID'
+        required: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+    
+    - name: Setup Java
+      uses: actions/setup-java@v4
+      with:
+        distribution: 'temurin'
+        java-version: '17'
+    
+    - name: Setup Android SDK
+      uses: android-actions/setup-android@v3
+      with:
+        cmdline-tools-version: 'latest'
+    
+    - name: Setup Flutter
+      uses: subosito/flutter-action@v2
+      with:
+        flutter-version: '3.22.0'
+        channel: 'stable'
+        cache: true
+    
+    - name: Download Project
+      run: |
+        DOWNLOAD_URL="${{ github.event.inputs.downloadUrl || github.event.client_payload.downloadUrl }}"
+        echo "Downloading from: $DOWNLOAD_URL"
+        curl -L -o project.zip "$DOWNLOAD_URL" --max-time 300
+        ls -la project.zip
+    
+    - name: Extract Project
+      run: |
+        mkdir project_temp
+        unzip -o project.zip -d project_temp
+        cd project_temp
+        
+        if [ -f "pubspec.yaml" ]; then
+          echo "PROJECT_ROOT=." >> $GITHUB_ENV
+          echo "PROJECT_TYPE=flutter" >> $GITHUB_ENV
+        elif [ -f "build.gradle" ]; then
+          echo "PROJECT_ROOT=." >> $GITHUB_ENV
+          echo "PROJECT_TYPE=android" >> $GITHUB_ENV
+        else
+          for dir in */; do
+            if [ -f "${dir}pubspec.yaml" ]; then
+              echo "PROJECT_ROOT=$dir" >> $GITHUB_ENV
+              echo "PROJECT_TYPE=flutter" >> $GITHUB_ENV
+              break
+            elif [ -f "${dir}build.gradle" ]; then
+              echo "PROJECT_ROOT=$dir" >> $GITHUB_ENV
+              echo "PROJECT_TYPE=android" >> $GITHUB_ENV
+              break
+            fi
+          done
+        fi
+        
+        mkdir -p project
+        mv * project/ 2>/dev/null || true
+        rm -rf project_temp
+    
+    - name: Build Flutter APK
+      if: env.PROJECT_TYPE == 'flutter'
+      run: |
+        cd project/${{ env.PROJECT_ROOT }}
+        flutter clean
+        flutter pub get
+        
+        if [ "${{ github.event.inputs.buildType || github.event.client_payload.buildType }}" = "release" ]; then
+          flutter build apk --release --no-tree-shake-icons
+          APK_PATH="build/app/outputs/flutter-apk/app-release.apk"
+        else
+          flutter build apk --debug
+          APK_PATH="build/app/outputs/flutter-apk/app-debug.apk"
+        fi
+        
+        echo "APK_PATH=$APK_PATH" >> $GITHUB_ENV
+    
+    - name: Build Android APK
+      if: env.PROJECT_TYPE == 'android'
+      run: |
+        cd project/${{ env.PROJECT_ROOT }}
+        chmod +x gradlew
+        
+        if [ "${{ github.event.inputs.buildType || github.event.client_payload.buildType }}" = "release" ]; then
+          ./gradlew assembleRelease --no-daemon
+          APK_PATH="app/build/outputs/apk/release/app-release.apk"
+        else
+          ./gradlew assembleDebug --no-daemon
+          APK_PATH="app/build/outputs/apk/debug/app-debug.apk"
+        fi
+        
+        echo "APK_PATH=$APK_PATH" >> $GITHUB_ENV
+    
+    - name: Upload APK to transfer.sh
+      id: upload
+      run: |
+        APK_FILE=$(find project -name "*.apk" | head -1)
+        echo "APK file: $APK_FILE"
+        APK_SIZE=$(stat -c%s "$APK_FILE")
+        APK_SIZE_MB=$(echo "scale=2; $APK_SIZE/1024/1024" | bc)
+        echo "APK_SIZE_MB=$APK_SIZE_MB" >> $GITHUB_ENV
+        
+        DOWNLOAD_URL=$(curl --upload-file "$APK_FILE" "https://transfer.sh/$(basename "$APK_FILE")" 2>/dev/null)
+        echo "DOWNLOAD_URL=$DOWNLOAD_URL" >> $GITHUB_ENV
+    
+    - name: Callback Success
+      run: |
+        CALLBACK_URL="${{ github.event.inputs.callbackUrl || github.event.client_payload.callbackUrl }}"
+        REQUEST_ID="${{ github.event.inputs.requestId || github.event.client_payload.requestId }}"
+        API_KEY="${{ secrets.BUILDER_API_KEY }}"
+        
+        curl -X POST "$CALLBACK_URL" \
+          -H "Content-Type: application/json" \
+          -H "X-API-Key: $API_KEY" \
+          -d '{
+            "requestId": "'"$REQUEST_ID"'",
+            "success": true,
+            "downloadUrl": "'"$DOWNLOAD_URL"'",
+            "fileSize": '$APK_SIZE',
+            "fileSizeMB": '$APK_SIZE_MB',
+            "message": "Build completed successfully"
+          }'
+    
+    - name: Callback Error
+      if: failure()
+      run: |
+        CALLBACK_URL="${{ github.event.inputs.callbackUrl || github.event.client_payload.callbackUrl }}"
+        REQUEST_ID="${{ github.event.inputs.requestId || github.event.client_payload.requestId }}"
+        API_KEY="${{ secrets.BUILDER_API_KEY }}"
+        
+        curl -X POST "$CALLBACK_URL" \
+          -H "Content-Type: application/json" \
+          -H "X-API-Key: $API_KEY" \
+          -d '{
+            "requestId": "'"$REQUEST_ID"'",
+            "success": false,
+            "error": "Build failed on GitHub Actions",
+            "message": "Build failed. Check your project files."
+          }'
